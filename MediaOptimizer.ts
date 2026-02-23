@@ -17,7 +17,7 @@
  * Install: npm install zod
  *
  * @author Production Coding Agent
- * @version 2.0.0
+ * @version 2.1.0
  * @license MIT
  */
 
@@ -107,9 +107,17 @@ const LIMITS = {
     minDpr: 1,
     maxDpr: 3,
     maxPathLength: 500,
+    maxPathSegments: 30,
+    maxPathSegmentLength: 255,
+    minResponsiveWidths: 1,
+    maxResponsiveWidths: 25,
 } as const;
 
 const RESPONSIVE_WIDTHS = [320, 640, 768, 1024, 1280, 1536, 1920] as const;
+const IMAGEKIT_HOST = 'ik.imagekit.io';
+const TRUSTED_SUPABASE_HOST_SUFFIX = '.supabase.co';
+const LOCALHOST_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+const SAFE_PATH_SEGMENT_PATTERN = /^[A-Za-z0-9._\-() ]+$/;
 
 // ============================================================================
 // SECTION 3: CUSTOM ERRORS
@@ -160,12 +168,75 @@ export class ValidationError extends MediaOptimizerError {
 // ============================================================================
 
 const ConfigSchema = z.object({
-    imageKitId: z.string().min(1, 'ImageKit ID is required'),
-    supabaseUrl: z.string().url('Invalid Supabase URL'),
-    bucketName: z.string().min(1, 'Bucket name is required'),
+    imageKitId: z
+        .string()
+        .trim()
+        .min(3, 'ImageKit ID is required')
+        .max(100, 'ImageKit ID is too long')
+        .regex(/^[A-Za-z0-9_-]+$/, 'ImageKit ID must contain only letters, numbers, "_" or "-"'),
+    supabaseUrl: z
+        .string()
+        .trim()
+        .url('Invalid Supabase URL')
+        .superRefine((value, ctx) => {
+            let parsed: URL;
+            try {
+                parsed = new URL(value);
+            } catch {
+                ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: 'Supabase URL could not be parsed',
+                });
+                return;
+            }
+
+            const host = parsed.hostname.toLowerCase();
+            const isLocalhost = isLocalhostHost(host);
+
+            if (parsed.username || parsed.password) {
+                ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: 'Supabase URL must not include credentials',
+                });
+            }
+
+            if (parsed.search || parsed.hash) {
+                ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: 'Supabase URL must not include query or fragment values',
+                });
+            }
+
+            if (parsed.pathname && parsed.pathname !== '/') {
+                ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: 'Supabase URL must be a root origin (no path)',
+                });
+            }
+
+            if (!isLocalhost && !host.endsWith(TRUSTED_SUPABASE_HOST_SUFFIX)) {
+                ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: `Supabase URL host must end with "${TRUSTED_SUPABASE_HOST_SUFFIX}" or use localhost`,
+                });
+            }
+
+            if (!isLocalhost && parsed.protocol !== 'https:') {
+                ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: 'Supabase URL must use HTTPS outside localhost',
+                });
+            }
+        }),
+    bucketName: z
+        .string()
+        .trim()
+        .min(1, 'Bucket name is required')
+        .max(63, 'Bucket name is too long')
+        .regex(/^[a-z0-9](?:[a-z0-9._-]{0,62})$/, 'Bucket name contains invalid characters'),
     forceBackupMode: z.boolean().optional().default(false),
     debug: z.boolean().optional().default(false),
-});
+}).strict();
 
 const TransformOptionsSchema = z.object({
     width: z.number().int().min(LIMITS.minWidth).max(LIMITS.maxWidth).optional(),
@@ -177,7 +248,12 @@ const TransformOptionsSchema = z.object({
     dpr: z.number().min(LIMITS.minDpr).max(LIMITS.maxDpr).optional(),
     blur: z.number().int().min(LIMITS.minBlur).max(LIMITS.maxBlur).optional(),
     sharpen: z.boolean().optional(),
-});
+}).strict();
+
+const ResponsiveWidthsSchema = z
+    .array(z.number().int().min(LIMITS.minWidth).max(LIMITS.maxWidth))
+    .min(LIMITS.minResponsiveWidths)
+    .max(LIMITS.maxResponsiveWidths);
 
 // ============================================================================
 // SECTION 5: PATH SANITIZATION
@@ -185,22 +261,100 @@ const TransformOptionsSchema = z.object({
 
 /** Dangerous patterns that indicate directory traversal or injection attempts */
 const DANGEROUS_PATTERNS = [
-    /\.\./,           // Parent directory traversal
-    /\.\\/,           // Windows parent traversal
-    /%2e%2e/i,        // URL encoded ..
-    /%252e/i,         // Double URL encoded .
-    /^\/+/,           // Leading slashes (we'll normalize these)
     /\0/,             // Null bytes
-    /<|>/,            // HTML injection
+    /%00/i,           // URL-encoded null byte
     /[<>:"|?*]/,      // Windows invalid characters
+    /<|>/,            // HTML-like injection
+    /[#?]/,           // Query or hash injection
+    /[\x00-\x1F\x7F]/ // Control characters
 ];
+
+/**
+ * Safely decodes a URI component up to N rounds to detect nested encodings.
+ */
+function decodePathRecursively(path: string, rounds = 3): string {
+    let decoded = path;
+
+    for (let i = 0; i < rounds; i += 1) {
+        try {
+            const next = decodeURIComponent(decoded);
+            if (next === decoded) break;
+            decoded = next;
+        } catch {
+            throw new InvalidPathError(path, 'Path contains malformed URL encoding');
+        }
+    }
+
+    return decoded;
+}
+
+/**
+ * Encodes each path segment to produce canonical safe URL paths.
+ */
+function encodePathSegments(path: string): string {
+    return path
+        .split('/')
+        .map(segment => encodeURIComponent(segment))
+        .join('/');
+}
+
+/**
+ * Small helper to avoid leaking full identifiers in debug logs.
+ */
+function maskIdentifier(value: string): string {
+    if (value.length <= 5) return '*'.repeat(value.length);
+    return `${value.slice(0, 3)}...${value.slice(-2)}`;
+}
+
+function normalizeOrigin(url: string): string {
+    const parsed = new URL(url);
+    return parsed.origin;
+}
+
+function isLocalhostHost(hostname: string): boolean {
+    return LOCALHOST_HOSTS.has(hostname.toLowerCase());
+}
+
+function assertSafeGeneratedUrl(
+    url: string,
+    expectedHost: string,
+    provider: 'imagekit' | 'supabase',
+    expectedPathPrefix?: string
+): void {
+    let parsed: URL;
+    try {
+        parsed = new URL(url);
+    } catch {
+        throw new ValidationError(`Generated ${provider} URL is malformed`);
+    }
+
+    if (!isLocalhostHost(parsed.hostname) && parsed.protocol !== 'https:') {
+        throw new ValidationError(`Generated ${provider} URL must use HTTPS`);
+    }
+
+    if (parsed.username || parsed.password) {
+        throw new ValidationError(`Generated ${provider} URL must not contain credentials`);
+    }
+
+    if (parsed.hostname.toLowerCase() !== expectedHost.toLowerCase()) {
+        throw new ValidationError(`Generated ${provider} URL host is not allowed`);
+    }
+
+    if (parsed.hash) {
+        throw new ValidationError(`Generated ${provider} URL must not include a fragment`);
+    }
+
+    if (expectedPathPrefix && !parsed.pathname.startsWith(expectedPathPrefix)) {
+        throw new ValidationError(`Generated ${provider} URL path is not allowed`);
+    }
+}
 
 /**
  * Sanitizes and validates a file path.
  * @throws {InvalidPathError} If path contains dangerous patterns
  */
 function sanitizePath(path: string): string {
-    if (!path || typeof path !== 'string') {
+    if (typeof path !== 'string' || !path.trim()) {
         throw new InvalidPathError(path, 'Path must be a non-empty string');
     }
 
@@ -208,25 +362,52 @@ function sanitizePath(path: string): string {
         throw new InvalidPathError(path, `Path exceeds maximum length of ${LIMITS.maxPathLength}`);
     }
 
-    // Check for dangerous patterns
+    const decodedPath = decodePathRecursively(path.trim());
+
+    // Check for dangerous patterns on both raw and decoded forms
     for (const pattern of DANGEROUS_PATTERNS) {
-        if (pattern.test(path)) {
+        if (pattern.test(path) || pattern.test(decodedPath)) {
             throw new InvalidPathError(path, 'Path contains forbidden characters or patterns');
         }
     }
 
     // Normalize the path
-    let cleanPath = path
+    const cleanPath = decodedPath
         .replace(/\\/g, '/')      // Normalize backslashes to forward slashes
         .replace(/\/+/g, '/')     // Remove duplicate slashes
         .replace(/^\/+/, '')      // Remove leading slashes
+        .replace(/\/+$/, '')      // Remove trailing slashes
         .trim();
 
     if (!cleanPath) {
         throw new InvalidPathError(path, 'Path is empty after sanitization');
     }
 
-    return cleanPath;
+    const segments = cleanPath.split('/');
+
+    if (segments.length > LIMITS.maxPathSegments) {
+        throw new InvalidPathError(path, `Path exceeds maximum depth of ${LIMITS.maxPathSegments} segments`);
+    }
+
+    for (const segment of segments) {
+        if (!segment || segment === '.' || segment === '..') {
+            throw new InvalidPathError(path, 'Path contains invalid "." or ".." segments');
+        }
+
+        if (segment.length > LIMITS.maxPathSegmentLength) {
+            throw new InvalidPathError(path, `Path segment exceeds ${LIMITS.maxPathSegmentLength} characters`);
+        }
+
+        if (segment.trim() !== segment) {
+            throw new InvalidPathError(path, 'Path segments must not have leading or trailing spaces');
+        }
+
+        if (!SAFE_PATH_SEGMENT_PATTERN.test(segment)) {
+            throw new InvalidPathError(path, 'Path segment contains unsupported characters');
+        }
+    }
+
+    return encodePathSegments(cleanPath);
 }
 
 // ============================================================================
@@ -343,6 +524,7 @@ class SupabaseProvider extends BaseProvider {
 let globalConfig: MediaConfig | null = null;
 let primaryProvider: ImageKitProvider | null = null;
 let backupProvider: SupabaseProvider | null = null;
+let allowedBackupHost: string | null = null;
 
 /**
  * Configures the media optimizer. Call once at app startup.
@@ -350,9 +532,9 @@ let backupProvider: SupabaseProvider | null = null;
  * @example
  * ```ts
  * configureMedia({
- *   imageKitId: process.env.NEXT_PUBLIC_IMAGEKIT_ID!,
- *   supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL!,
- *   bucketName: 'uploads',
+ *   imageKitId: process.env.IMAGEKIT_ID!,
+ *   supabaseUrl: process.env.SUPABASE_URL!,
+ *   bucketName: process.env.SUPABASE_BUCKET!,
  * });
  * ```
  *
@@ -366,14 +548,21 @@ export function configureMedia(config: MediaConfig): void {
         throw new ConfigurationError(errors);
     }
 
-    globalConfig = result.data;
+    const normalizedSupabaseUrl = normalizeOrigin(result.data.supabaseUrl);
+    globalConfig = {
+        ...result.data,
+        supabaseUrl: normalizedSupabaseUrl,
+    };
+
+    allowedBackupHost = new URL(normalizedSupabaseUrl).hostname.toLowerCase();
+
     primaryProvider = new ImageKitProvider(globalConfig.imageKitId);
     backupProvider = new SupabaseProvider(globalConfig.supabaseUrl, globalConfig.bucketName);
 
     if (globalConfig.debug) {
         console.log('[MediaOptimizer] Configured with:', {
-            imageKitId: globalConfig.imageKitId,
-            supabaseUrl: globalConfig.supabaseUrl,
+            imageKitId: maskIdentifier(globalConfig.imageKitId),
+            supabaseHost: allowedBackupHost,
             bucketName: globalConfig.bucketName,
             forceBackupMode: globalConfig.forceBackupMode,
         });
@@ -391,7 +580,7 @@ export function getConfig(): Readonly<MediaConfig> | null {
  * Ensures configuration is set before use.
  */
 function ensureConfigured(): void {
-    if (!globalConfig || !primaryProvider || !backupProvider) {
+    if (!globalConfig || !primaryProvider || !backupProvider || !allowedBackupHost) {
         throw new ConfigurationError(
             'Media optimizer not configured. Call configureMedia() at app startup.'
         );
@@ -443,6 +632,13 @@ export function getMediaUrl(path: string, options: TransformOptions = {}): Optim
     // Generate URLs
     const primary = primaryProvider!.generateUrl(safePath, opts);
     const backup = backupProvider!.generateUrl(safePath, opts);
+    assertSafeGeneratedUrl(primary, IMAGEKIT_HOST, 'imagekit', `/${globalConfig!.imageKitId}/`);
+    assertSafeGeneratedUrl(
+        backup,
+        allowedBackupHost!,
+        'supabase',
+        `/storage/v1/render/image/public/${globalConfig!.bucketName}/`
+    );
 
     // Handle force backup mode
     if (globalConfig!.forceBackupMode) {
@@ -482,11 +678,17 @@ export function getResponsiveSrcSet(
 ): string {
     ensureConfigured();
 
-    const safePath = sanitizePath(path);
+    const widthsResult = ResponsiveWidthsSchema.safeParse(widths);
+    if (!widthsResult.success) {
+        const errors = widthsResult.error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ');
+        throw new ValidationError(`Invalid responsive widths: ${errors}`);
+    }
 
-    return widths
+    const uniqueWidths = widthsResult.data.filter((width, index, list) => list.indexOf(width) === index);
+
+    return uniqueWidths
         .map(width => {
-            const { src } = getMediaUrl(safePath, { ...options, width });
+            const { src } = getMediaUrl(path, { ...options, width });
             return `${src} ${width}w`;
         })
         .join(', ');

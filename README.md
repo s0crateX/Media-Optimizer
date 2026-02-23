@@ -1,65 +1,80 @@
 # MediaOptimizer
 
-Production-grade image URL optimizer for TypeScript and React projects.
+Secure media URL optimizer for TypeScript and React.
 
-`MediaOptimizer.ts` gives you one API for generating optimized image URLs with:
-- ImageKit as the primary provider
-- Supabase Storage render API as the fallback provider
-- Runtime validation and path sanitization
-- Optional React hook support
+`MediaOptimizer.ts` generates optimized image URLs with:
+- ImageKit as primary provider
+- Supabase render API as fallback provider
+- strict runtime validation
+- hardened path sanitization
+- responsive `srcSet` support
 
-## Repository Contents
+## Highlights
 
-- `MediaOptimizer.ts`: Main production module (v2)
-- `AdaptiveMediaGateway.tsx`: Legacy/earlier implementation (v1 style)
-- `MediaOptimizer.README.md`: Previous draft documentation
-- `media-optimizer-refactor-prompt.md`: Refactor specification/prompt
-
-## Features
-
-- Strong runtime validation using `zod`
-- Safe path sanitization to block traversal and malformed paths
-- Provider fallback support (`imagekit` -> `supabase`)
-- Responsive `srcSet` generation
-- React hook: `useOptimizedImage`
-- Typed custom errors for clearer debugging
+- Zod-validated config and transform options
+- strict provider URL host/protocol validation
+- path canonicalization with encoded traversal defense
+- provider failover (`imagekit` -> `supabase`)
+- React hook (`useOptimizedImage`)
+- typed custom errors for safe handling
 
 ## Requirements
 
 - Node.js 16+
 - TypeScript 4.5+
-- React 17+ (required by this file because it imports `useMemo`)
+- React 17+ (required because `MediaOptimizer.ts` imports `useMemo`)
 - `zod` 3.x
 
-You also need:
-- An ImageKit account (Web Proxy configured)
-- A Supabase project with Storage enabled
+Service requirements:
+- ImageKit account (Web Proxy mode)
+- Supabase project with Storage enabled
 
 ## Installation
-
-1. Install dependency:
 
 ```bash
 npm install zod
 ```
 
-2. Copy `MediaOptimizer.ts` into your project (example: `src/lib/MediaOptimizer.ts`).
+Then copy `MediaOptimizer.ts` into your project (example: `src/lib/MediaOptimizer.ts`).
 
-3. Configure once at app startup.
+## Security-First Setup
 
-## Quick Start
+Initialize once at app startup using server-controlled values:
 
 ```ts
-// app/layout.tsx, _app.tsx, or app bootstrap file
 import { configureMedia } from './lib/MediaOptimizer';
 
 configureMedia({
-  imageKitId: process.env.NEXT_PUBLIC_IMAGEKIT_ID!,
-  supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  bucketName: process.env.NEXT_PUBLIC_SUPABASE_BUCKET!,
+  imageKitId: process.env.IMAGEKIT_ID!,
+  supabaseUrl: process.env.SUPABASE_URL!, // ex: https://project-ref.supabase.co
+  bucketName: process.env.SUPABASE_BUCKET!,
   forceBackupMode: false,
   debug: false,
 });
+```
+
+Config validation rules:
+- `imageKitId`: alphanumeric, `_`, `-`
+- `supabaseUrl`: root origin only, no query/hash/credentials
+- `supabaseUrl`: HTTPS for non-localhost, host must end with `.supabase.co`
+- `bucketName`: validated safe format
+
+## Quick Usage
+
+```ts
+import { getMediaUrl } from './lib/MediaOptimizer';
+
+const media = getMediaUrl('images/hero.jpg', {
+  width: 1600,
+  quality: 85,
+  format: 'webp',
+  fit: 'cover',
+  focal: 'face',
+});
+
+// media.src
+// media.fallbackSrc
+// media.provider
 ```
 
 ```tsx
@@ -86,58 +101,35 @@ export function HeroImage() {
 }
 ```
 
-## API Reference
+## API
 
-### `configureMedia(config: MediaConfig): void`
+### `configureMedia(config)`
 
-Call once before using any URL generation methods.
+Required before any URL generation.
 
-```ts
-configureMedia({
-  imageKitId: 'your_imagekit_id',
-  supabaseUrl: 'https://your-project.supabase.co',
-  bucketName: 'public',
-  forceBackupMode: false,
-  debug: false,
-});
-```
+### `getConfig()`
 
-### `getConfig(): Readonly<MediaConfig> | null`
+Returns current config or `null`.
 
-Returns current config if set, otherwise `null`.
+### `getMediaUrl(path, options?)`
 
-### `getMediaUrl(path, options?): OptimizedMedia`
+Returns:
+- `src`
+- `fallbackSrc`
+- `provider`
 
-Generates:
-- `src`: primary URL
-- `fallbackSrc`: backup URL
-- `provider`: `'imagekit' | 'supabase'`
+### `getResponsiveSrcSet(path, options?, widths?)`
 
-```ts
-const media = getMediaUrl('avatars/user-123.jpg', {
-  width: 300,
-  height: 300,
-  quality: 80,
-  format: 'webp',
-  fit: 'cover',
-  focal: 'face',
-});
-```
-
-### `getResponsiveSrcSet(path, options?, widths?): string`
-
-Creates a responsive `srcSet` string.
+Returns a `srcSet` string.
 
 Default widths:
 `[320, 640, 768, 1024, 1280, 1536, 1920]`
 
-### `getOptimizedMedia(path, options?): OptimizedMedia`
+### `getOptimizedMedia(path, options?)`
 
-Returns `getMediaUrl(...)` plus `srcSet`.
+Returns `getMediaUrl(...)` + `srcSet`.
 
-### `useOptimizedImage(path, options?): UseOptimizedImageResult`
-
-React hook wrapper with memoization and graceful error handling.
+### `useOptimizedImage(path, options?)`
 
 Returns:
 - `src`
@@ -148,7 +140,6 @@ Returns:
 
 ## Transform Options
 
-`TransformOptions` supports:
 - `width`: `1..4000`
 - `height`: `1..4000`
 - `quality`: `1..100`
@@ -159,6 +150,15 @@ Returns:
 - `blur`: `1..100`
 - `sharpen`: `boolean`
 
+## Security Controls
+
+- canonical path sanitization with segment allowlist
+- recursive decode checks for encoded traversal attempts
+- query/hash/control character blocking in paths
+- generated URL protocol and host verification per provider
+- strict validation of responsive width arrays
+- reduced debug exposure via masked identifiers
+
 ## Error Types
 
 - `MediaOptimizerError`
@@ -166,51 +166,10 @@ Returns:
 - `ConfigurationError`
 - `ValidationError`
 
-Example:
+## Legacy Compatibility
 
-```ts
-import { InvalidPathError, getMediaUrl } from './lib/MediaOptimizer';
-
-try {
-  getMediaUrl('../../../etc/passwd');
-} catch (error) {
-  if (error instanceof InvalidPathError) {
-    console.error(error.message);
-  }
-}
-```
-
-## Security Notes
-
-- Paths are sanitized and validated before URL generation.
-- Dangerous patterns (like `..`, encoded traversal variants, invalid characters) are blocked.
-- Invalid option values are rejected with descriptive validation errors.
-
-## Migration (v1 -> v2)
-
-If you used `AdaptiveMediaGateway.tsx`:
-
-- `getMediaUrls()` -> `getMediaUrl()`
-- `backupSrc` -> `fallbackSrc`
-- Adds Zod validation, custom errors, `getResponsiveSrcSet`, and `useOptimizedImage`
-
-## Troubleshooting
-
-### `Configuration error: Media optimizer not configured`
-
-Call `configureMedia(...)` once before any `getMediaUrl(...)` call.
-
-### Invalid Supabase URL
-
-Use full URL with protocol:
-- Correct: `https://your-project.supabase.co`
-- Incorrect: `your-project.supabase.co`
-
-### ImageKit URL works poorly or fails
-
-- Verify ImageKit Web Proxy source
-- Verify bucket/path alignment
-- Temporarily set `forceBackupMode: true` to test Supabase output
+`AdaptiveMediaGateway.tsx` is retained as a compatibility wrapper.
+It now routes through the hardened `MediaOptimizer.ts` engine.
 
 ## License
 
